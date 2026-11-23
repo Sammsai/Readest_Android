@@ -1,0 +1,209 @@
+name: Build Self-Hosted Readest Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '上游版本（填 latest 自动取最新 Release，也可填具体 tag 如 v0.12.20 或分支 main）'
+        required: true
+        default: 'latest'
+        type: string
+      arch:
+        description: '目标 CPU 架构（现代手机选 aarch64；旧 32 位设备选 armv7）'
+        required: true
+        default: 'aarch64'
+        type: choice
+        options:
+          - aarch64
+          - armv7
+          - x86_64
+
+permissions:
+  contents: write
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Validate required secrets
+        env:
+          BACKEND_URL: ${{ secrets.BACKEND_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          if [ -z "$BACKEND_URL" ] || [ -z "$SUPABASE_ANON_KEY" ]; then
+            echo "::error::请先在仓库 Settings -> Secrets -> Actions 中配置 BACKEND_URL 和 SUPABASE_ANON_KEY"
+            exit 1
+          fi
+
+      - name: Clone upstream readest/readest
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          REF="$INPUT_REF"
+          if [ "$REF" = "latest" ]; then
+            REF=$(curl -fsSL \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/readest/readest/releases/latest | jq -r '.tag_name')
+            echo "Resolved upstream latest release: $REF"
+          fi
+          echo "RESOLVED_REF=$REF" >> "$GITHUB_ENV"
+          git clone --depth 1 --branch "$REF" https://github.com/readest/readest.git .
+          git submodule update --init --recursive
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: zulu
+          java-version: 17
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+
+      - name: Install Android NDK (auto-matched to upstream)
+        run: |
+          set -euo pipefail
+          NDK_VER=$(grep -oE 'ndk;[0-9.]+' .github/workflows/release.yml | head -n 1 | cut -d';' -f2 || true)
+          NDK_VER="${NDK_VER:-28.2.13676358}"
+          echo "Installing NDK $NDK_VER"
+          sdkmanager "ndk;${NDK_VER}"
+          echo "NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VER}" >> "$GITHUB_ENV"
+
+      - name: Install dependencies and vendor assets
+        run: |
+          pnpm install --frozen-lockfile --prefer-offline
+          pnpm --filter @readest/readest-app setup-vendors
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ inputs.arch == 'aarch64' && 'aarch64-linux-android' || (inputs.arch == 'armv7' && 'armv7-linux-androideabi' || 'x86_64-linux-android') }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android-${{ inputs.arch }}-cargo
+
+      - name: Write self-hosted .env.local
+        env:
+          BACKEND_URL: ${{ secrets.BACKEND_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          set -euo pipefail
+          BASE="${BACKEND_URL%/}"
+          cat <<EOF > apps/readest-app/.env.local
+          NEXT_PUBLIC_APP_PLATFORM=tauri
+          NEXT_PUBLIC_SUPABASE_URL=${BASE}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
+          NEXT_PUBLIC_API_BASE_URL=${BASE}
+          NEXT_PUBLIC_NODE_BASE_URL=${BASE}
+          NEXT_PUBLIC_SELF_HOSTED=true
+          NEXT_PUBLIC_DISABLE_UPDATER=true
+          EOF
+
+      - name: Build signed Android APK
+        env:
+          ANDROID_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          NODE_OPTIONS: '--max-old-space-size=6144'
+        run: |
+          set -euo pipefail
+          cd apps/readest-app
+
+          # 重新生成 Gradle 脚手架并还原上游定制的 Android 配置
+          rm -rf src-tauri/gen/android
+          pnpm tauri android init
+          pnpm tauri icon ../../data/icons/readest-book.png
+          git checkout -- src-tauri/gen/android
+
+          # 配置签名密钥
+          KEYSTORE_PATH="$RUNNER_TEMP/keystore.jks"
+          if [ -n "$ANDROID_KEY_BASE64" ] && [ -n "$ANDROID_KEY_ALIAS" ] && [ -n "$ANDROID_KEY_PASSWORD" ]; then
+            printf '%s' "$ANDROID_KEY_BASE64" | tr -d '\r\n ' | base64 -d > "$KEYSTORE_PATH"
+            KEY_ALIAS="$ANDROID_KEY_ALIAS"
+            KEY_PASS="$ANDROID_KEY_PASSWORD"
+          else
+            echo "::warning::未配置 ANDROID_KEY_* Secrets，本次将使用临时密钥签名（下次更新需先卸载旧版）"
+            KEY_ALIAS="readest"
+            KEY_PASS="readest-temp-pass"
+            keytool -genkeypair -keystore "$KEYSTORE_PATH" -alias "$KEY_ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 3650 \
+              -dname "CN=Readest,O=SelfHosted" \
+              -storepass "$KEY_PASS" -keypass "$KEY_PASS"
+          fi
+
+          cat <<EOF > src-tauri/gen/android/keystore.properties
+          keyAlias=${KEY_ALIAS}
+          password=${KEY_PASS}
+          storeFile=${KEYSTORE_PATH}
+          EOF
+
+          # 仅编译 APK，跳过 AAB
+          pnpm tauri android build --apk -t "${{ inputs.arch }}"
+
+          BUILT_APK=$(find src-tauri/gen/android/app/build/outputs/apk -name '*-release.apk' ! -name '*-unsigned.apk' | head -n 1)
+          if [ -z "$BUILT_APK" ]; then
+            echo "::error::未找到已签名的 release APK"
+            exit 1
+          fi
+
+          VERSION=$(node -p "require('./package.json').version")
+          UPSTREAM_SHA=$(git rev-parse --short HEAD)
+          OUT_NAME="Readest_${VERSION}_${{ inputs.arch }}_selfhosted.apk"
+          cp "$BUILT_APK" "$RUNNER_TEMP/$OUT_NAME"
+
+          echo "APP_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "UPSTREAM_SHA=$UPSTREAM_SHA" >> "$GITHUB_ENV"
+          echo "APK_PATH=$RUNNER_TEMP/$OUT_NAME" >> "$GITHUB_ENV"
+          echo "APK_NAME=$OUT_NAME" >> "$GITHUB_ENV"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.APK_NAME }}
+          path: ${{ env.APK_PATH }}
+          retention-days: 30
+
+      - name: Publish APK to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          SAFE_REF="${RESOLVED_REF//\//-}"
+          if [[ "$RESOLVED_REF" == v* ]]; then
+            RELEASE_TAG="$RESOLVED_REF"
+          else
+            RELEASE_TAG="v${APP_VERSION}-${SAFE_REF}-${UPSTREAM_SHA}"
+          fi
+
+          NOTES=$(printf 'Upstream: https://github.com/readest/readest/tree/%s (%s)\nArch: %s\n' \
+            "$RESOLVED_REF" "$UPSTREAM_SHA" "${{ inputs.arch }}")
+
+          # 显式指定 -R "$GITHUB_REPOSITORY"，避免 gh 读取到当前目录上游 readest/readest 的 remote
+          if gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$APK_PATH" --clobber -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" "$APK_PATH" \
+              -R "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_REF_NAME" \
+              --title "Readest ${RELEASE_TAG} (Self-Hosted)" \
+              --notes "$NOTES"
+          fi
